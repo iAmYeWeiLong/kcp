@@ -268,17 +268,17 @@ struct IKCPSEG
 {
 	struct IQUEUEHEAD node;
 	IUINT32 conv;
-	IUINT32 cmd;
-	IUINT32 frg;
+	IUINT32 cmd; // command
+	IUINT32 frg; // fragment 序号
 	IUINT32 wnd;
-	IUINT32 ts;
-	IUINT32 sn;
-	IUINT32 una;
+	IUINT32 ts; // timestamp 时间戳
+	IUINT32 sn; // Sequence Number,Segment的编号
+	IUINT32 una; // unacknowledged
 	IUINT32 len;
-	IUINT32 resendts;
-	IUINT32 rto;
-	IUINT32 fastack;
-	IUINT32 xmit;
+	IUINT32 resendts; // resend timestamp
+	IUINT32 rto; // retransmission timeout
+	IUINT32 fastack; // fast ack 以数据驱动的快速重传机制
+	IUINT32 xmit; // 每发送一次会自加一。用于统计该Segment被重传了几次
 	char data[1];
 };
 
@@ -290,9 +290,9 @@ struct IKCPCB
 {
 	IUINT32 conv, mtu, mss, state;
 	IUINT32 snd_una, snd_nxt, rcv_nxt;
-	IUINT32 ts_recent, ts_lastack, ssthresh;
+	IUINT32 ts_recent, ts_lastack, ssthresh; // ; ;slow start thrshold 慢启动阀值
 	IINT32 rx_rttval, rx_srtt, rx_rto, rx_minrto;
-	IUINT32 snd_wnd, rcv_wnd, rmt_wnd, cwnd, probe;
+	IUINT32 snd_wnd, rcv_wnd, rmt_wnd, cwnd, probe; // send_window;receive_window;remote_window;
 	IUINT32 current, interval, ts_flush, xmit;
 	IUINT32 nrcv_buf, nsnd_buf;
 	IUINT32 nrcv_que, nsnd_que;

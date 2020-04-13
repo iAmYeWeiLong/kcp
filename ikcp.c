@@ -26,18 +26,18 @@ const IUINT32 IKCP_RTO_NDL = 30;		// no delay min rto
 const IUINT32 IKCP_RTO_MIN = 100;		// normal min rto
 const IUINT32 IKCP_RTO_DEF = 200;
 const IUINT32 IKCP_RTO_MAX = 60000;
-const IUINT32 IKCP_CMD_PUSH = 81;		// cmd: push data
-const IUINT32 IKCP_CMD_ACK  = 82;		// cmd: ack
-const IUINT32 IKCP_CMD_WASK = 83;		// cmd: window probe (ask)
-const IUINT32 IKCP_CMD_WINS = 84;		// cmd: window size (tell)
+const IUINT32 IKCP_CMD_PUSH = 81;		// cmd: push data 发送数据给远端
+const IUINT32 IKCP_CMD_ACK  = 82;		// cmd: ack 告诉远端自己收到了哪个编号的数据
+const IUINT32 IKCP_CMD_WASK = 83;		// cmd: window probe (ask) 询问远端的数据接收窗口还剩余多少
+const IUINT32 IKCP_CMD_WINS = 84;		// cmd: window size (tell) 回应远端自己的数据接收窗口大小
 const IUINT32 IKCP_ASK_SEND = 1;		// need to send IKCP_CMD_WASK
 const IUINT32 IKCP_ASK_TELL = 2;		// need to send IKCP_CMD_WINS
 const IUINT32 IKCP_WND_SND = 32;
 const IUINT32 IKCP_WND_RCV = 128;       // must >= max fragment size
-const IUINT32 IKCP_MTU_DEF = 1400;
+const IUINT32 IKCP_MTU_DEF = 1400;      // 默认 mtu 是 1400 字节，可以使用 ikcp_setmtu 来设置该值。该值将会影响数据包归并及分片时候的最大传输单元
 const IUINT32 IKCP_ACK_FAST	= 3;
 const IUINT32 IKCP_INTERVAL	= 100;
-const IUINT32 IKCP_OVERHEAD = 24;
+const IUINT32 IKCP_OVERHEAD = 24; // TCP 则是 20 byte 的头
 const IUINT32 IKCP_DEADLINK = 20;
 const IUINT32 IKCP_THRESH_INIT = 2;
 const IUINT32 IKCP_THRESH_MIN = 2;
@@ -507,11 +507,12 @@ int ikcp_send(ikcpcb *kcp, const char *buffer, int len)
 	if (len <= (int)kcp->mss) count = 1;
 	else count = (len + kcp->mss - 1) / kcp->mss;
 
-	if (count >= (int)IKCP_WND_RCV) return -2;
+	if (count >= (int)IKCP_WND_RCV) return -2; // 说明外部也不能直接 ikcp_send() 太大的 data
 
 	if (count == 0) count = 1;
 
-	// fragment
+	// fragment. 外部的一次 ikcp_send() 可能会拆分成多个 segment
+	// 数据先放到 snd_queue, 后面调用 ikcp_flush() 时再搬到 snd_queue
 	for (i = 0; i < count; i++) {
 		int size = len > (int)kcp->mss ? (int)kcp->mss : len;
 		seg = ikcp_segment_new(kcp, size);
@@ -568,6 +569,7 @@ static void ikcp_shrink_buf(ikcpcb *kcp)
 	}
 }
 
+// 选择性 ack.从 snd_buf 中删除 sn 节点
 static void ikcp_parse_ack(ikcpcb *kcp, IUINT32 sn)
 {
 	struct IQUEUEHEAD *p, *next;
@@ -590,6 +592,7 @@ static void ikcp_parse_ack(ikcpcb *kcp, IUINT32 sn)
 	}
 }
 
+// 把 send buffer una 之前的全删了。
 static void ikcp_parse_una(ikcpcb *kcp, IUINT32 una)
 {
 	struct IQUEUEHEAD *p, *next;
@@ -692,21 +695,23 @@ void ikcp_parse_data(ikcpcb *kcp, IKCPSEG *newseg)
 		return;
 	}
 
+	// 把 new segment 插入到 rcv_buf
+	// 逆序遍历 （rcv_buf 也是按 sn 从小到大排序的）
 	for (p = kcp->rcv_buf.prev; p != &kcp->rcv_buf; p = prev) {
 		IKCPSEG *seg = iqueue_entry(p, IKCPSEG, node);
 		prev = p->prev;
-		if (seg->sn == sn) {
+		if (seg->sn == sn) { // 重复的数据；发生超时重传 或 快速重传之后，网络上就可能有多个相同的 segment
 			repeat = 1;
 			break;
 		}
-		if (_itimediff(sn, seg->sn) > 0) {
+		if (_itimediff(sn, seg->sn) > 0) { // 找到了合适的插入位置
 			break;
 		}
 	}
 
 	if (repeat == 0) {
 		iqueue_init(&newseg->node);
-		iqueue_add(&newseg->node, p);
+		iqueue_add(&newseg->node, p); // 插入到 p 之前
 		kcp->nrcv_buf++;
 	}	else {
 		ikcp_segment_delete(kcp, newseg);
@@ -758,7 +763,7 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 
 	if (data == NULL || (int)size < (int)IKCP_OVERHEAD) return -1;
 
-	while (1) {
+	while (1) { // 外部一次收包可能会有多个 segment
 		IUINT32 ts, sn, len, una, conv;
 		IUINT16 wnd;
 		IUINT8 cmd, frg;
@@ -789,7 +794,7 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 		ikcp_parse_una(kcp, una);
 		ikcp_shrink_buf(kcp);
 
-		if (cmd == IKCP_CMD_ACK) {
+		if (cmd == IKCP_CMD_ACK) { // 除了每个包都有 una ，还有专门的 ack 命令
 			if (_itimediff(kcp->current, ts) >= 0) {
 				ikcp_update_ack(kcp, _itimediff(kcp->current, ts));
 			}
@@ -825,7 +830,7 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 					"input psh: sn=%lu ts=%lu", (unsigned long)sn, (unsigned long)ts);
 			}
 			if (_itimediff(sn, kcp->rcv_nxt + kcp->rcv_wnd) < 0) {
-				ikcp_ack_push(kcp, sn, ts);
+				ikcp_ack_push(kcp, sn, ts); // 生成当前包的ack（会在 flush 中发送 ack 给远端)
 				if (_itimediff(sn, kcp->rcv_nxt) >= 0) {
 					seg = ikcp_segment_new(kcp, len);
 					seg->conv = conv;
@@ -918,7 +923,7 @@ static char *ikcp_encode_seg(char *ptr, const IKCPSEG *seg)
 
 static int ikcp_wnd_unused(const ikcpcb *kcp)
 {
-	if (kcp->nrcv_que < kcp->rcv_wnd) {
+	if (kcp->nrcv_que < kcp->rcv_wnd) { // 看样子 rcv_que 有可能大于 rcv_wnd !!!??? 莫非是运行中 调用过 ikcp_wndsize() 改过窗口大小
 		return kcp->rcv_wnd - kcp->nrcv_que;
 	}
 	return 0;
@@ -953,7 +958,8 @@ void ikcp_flush(ikcpcb *kcp)
 	seg.sn = 0;
 	seg.ts = 0;
 
-	// flush acknowledges
+	// flush acknowledges; 因为是全双工，己方也会收到的数据，要发 ack 给对端
+	// 数据 是 ikcp_input() 中收到 IKCP_CMD_PUSH 命令时准备好的。
 	count = kcp->ackcount;
 	for (i = 0; i < count; i++) {
 		size = (int)(ptr - buffer);
@@ -962,7 +968,7 @@ void ikcp_flush(ikcpcb *kcp)
 			ptr = buffer;
 		}
 		ikcp_ack_get(kcp, i, &seg.sn, &seg.ts);
-		ptr = ikcp_encode_seg(ptr, &seg);
+		ptr = ikcp_encode_seg(ptr, &seg); // 一个 ack 产生一个 segment（选择性 ack）;会不会比较冗余啊？
 	}
 
 	kcp->ackcount = 0;
@@ -990,7 +996,7 @@ void ikcp_flush(ikcpcb *kcp)
 	}
 
 	// flush window probing commands
-	if (kcp->probe & IKCP_ASK_SEND) {
+	if (kcp->probe & IKCP_ASK_SEND) { // 就在上面设的标志
 		seg.cmd = IKCP_CMD_WASK;
 		size = (int)(ptr - buffer);
 		if (size + (int)IKCP_OVERHEAD > (int)kcp->mtu) {
@@ -1001,7 +1007,7 @@ void ikcp_flush(ikcpcb *kcp)
 	}
 
 	// flush window probing commands
-	if (kcp->probe & IKCP_ASK_TELL) {
+	if (kcp->probe & IKCP_ASK_TELL) { // ikcp_input 收包那里设的这个标志
 		seg.cmd = IKCP_CMD_WINS;
 		size = (int)(ptr - buffer);
 		if (size + (int)IKCP_OVERHEAD > (int)kcp->mtu) {
@@ -1111,7 +1117,7 @@ void ikcp_flush(ikcpcb *kcp)
 		ikcp_output(kcp, buffer, size);
 	}
 
-	// update ssthresh
+	// update ssthresh. 更新 slow start threshold
 	if (change) {
 		IUINT32 inflight = kcp->snd_nxt - kcp->snd_una;
 		kcp->ssthresh = inflight / 2;
@@ -1227,7 +1233,7 @@ int ikcp_setmtu(ikcpcb *kcp, int mtu)
 	if (buffer == NULL) 
 		return -2;
 	kcp->mtu = mtu;
-	kcp->mss = kcp->mtu - IKCP_OVERHEAD;
+	kcp->mss = kcp->mtu - IKCP_OVERHEAD; // 重设了 MTU 同时也要重设 mss
 	ikcp_free(kcp->buffer);
 	kcp->buffer = buffer;
 	return 0;
