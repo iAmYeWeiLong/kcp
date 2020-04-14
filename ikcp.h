@@ -275,7 +275,7 @@ struct IKCPSEG
 	IUINT32 sn; // Sequence Number,Segment的编号
 	IUINT32 una; // unacknowledged
 	IUINT32 len;
-	IUINT32 resendts; // resend timestamp
+	IUINT32 resendts; // resend timestamp 时间到了这个时间戳就发重发
 	IUINT32 rto; // retransmission timeout
 	IUINT32 fastack; // fast ack 以数据驱动的快速重传机制
 	IUINT32 xmit; // 每发送一次会自加一。用于统计该Segment被重传了几次

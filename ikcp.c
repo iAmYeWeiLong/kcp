@@ -794,8 +794,10 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 		ikcp_parse_una(kcp, una);
 		ikcp_shrink_buf(kcp);
 
-		if (cmd == IKCP_CMD_ACK) { // 除了每个包都有 una ，还有专门的 ack 命令
+		if (cmd == IKCP_CMD_ACK) { // 除了每个包都有 una ，还有专门的 ack 命令（选择性 ack）
 			if (_itimediff(kcp->current, ts) >= 0) {
+				// other 此处实际上是在更新rto
+				// other 因为此时收到远端的ack，所以我们知道远端的包到本机的时间，因此可统计当前的网速如何，进行调整
 				ikcp_update_ack(kcp, _itimediff(kcp->current, ts));
 			}
 			ikcp_parse_ack(kcp, sn);
@@ -829,9 +831,9 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 				ikcp_log(kcp, IKCP_LOG_IN_DATA, 
 					"input psh: sn=%lu ts=%lu", (unsigned long)sn, (unsigned long)ts);
 			}
-			if (_itimediff(sn, kcp->rcv_nxt + kcp->rcv_wnd) < 0) {
+			if (_itimediff(sn, kcp->rcv_nxt + kcp->rcv_wnd) < 0) { // other 如果还有足够多的接收窗口
 				ikcp_ack_push(kcp, sn, ts); // 生成当前包的ack（会在 flush 中发送 ack 给远端)
-				if (_itimediff(sn, kcp->rcv_nxt) >= 0) {
+				if (_itimediff(sn, kcp->rcv_nxt) >= 0) { // other 如果当前segment还没被接收过sn >= rcv_next
 					seg = ikcp_segment_new(kcp, len);
 					seg->conv = conv;
 					seg->cmd = cmd;
@@ -853,12 +855,12 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 		else if (cmd == IKCP_CMD_WASK) {
 			// ready to send back IKCP_CMD_WINS in ikcp_flush
 			// tell remote my window size
-			kcp->probe |= IKCP_ASK_TELL;
+			kcp->probe |= IKCP_ASK_TELL; // 询问窗口，并不马上回复。需要 ikcp_update() 时再回复
 			if (ikcp_canlog(kcp, IKCP_LOG_IN_PROBE)) {
 				ikcp_log(kcp, IKCP_LOG_IN_PROBE, "input probe");
 			}
 		}
-		else if (cmd == IKCP_CMD_WINS) {
+		else if (cmd == IKCP_CMD_WINS) { // 窗口大小包头上有专门字段，这里不用做什么了
 			// do nothing
 			if (ikcp_canlog(kcp, IKCP_LOG_IN_WINS)) {
 				ikcp_log(kcp, IKCP_LOG_IN_WINS,
@@ -1018,7 +1020,7 @@ void ikcp_flush(ikcpcb *kcp)
 	}
 
 	kcp->probe = 0;
-
+	// other 计算窗口大小，以决定接下来是否继续发送数据
 	// calculate window size
 	cwnd = _imin_(kcp->snd_wnd, kcp->rmt_wnd);
 	if (kcp->nocwnd == 0) cwnd = _imin_(kcp->cwnd, cwnd);
@@ -1047,6 +1049,7 @@ void ikcp_flush(ikcpcb *kcp)
 		newseg->xmit = 0;
 	}
 
+	//  计算重传时间
 	// calculate resent
 	resent = (kcp->fastresend > 0)? (IUINT32)kcp->fastresend : 0xffffffff;
 	rtomin = (kcp->nodelay == 0)? (kcp->rx_rto >> 3) : 0;
@@ -1055,12 +1058,13 @@ void ikcp_flush(ikcpcb *kcp)
 	for (p = kcp->snd_buf.next; p != &kcp->snd_buf; p = p->next) {
 		IKCPSEG *segment = iqueue_entry(p, IKCPSEG, node);
 		int needsend = 0;
-		if (segment->xmit == 0) {
+		if (segment->xmit == 0) { // other 该segment是第一次发送，需要发送出去
 			needsend = 1;
 			segment->xmit++;
 			segment->rto = kcp->rx_rto;
 			segment->resendts = current + segment->rto + rtomin;
 		}
+		// other 当前时间已经到了该segment的重发时间（却还在snd_buf中，证明一直没收到该segment的ack，可认为这个segment丢了），也需要发送出去
 		else if (_itimediff(current, segment->resendts) >= 0) {
 			needsend = 1;
 			segment->xmit++;
@@ -1073,6 +1077,10 @@ void ikcp_flush(ikcpcb *kcp)
 			segment->resendts = current + segment->rto;
 			lost = 1;
 		}
+		// other 该segment的fastack大于resent了，也认为需要重发出去
+		// 1. fastack是个计数器，每次收到远端的ack包时，而该包又不属于自己的ack包时，该值就会加1
+        // 2. resent由fastresend赋值，fastresend可由外部配置是否快速重传
+        // 3. 这个条件可加快丢包重传，但会浪费多点带宽（因为可能该segment只是到达的慢一点而已，这个会导致有更高的概率重传多次同一个segment）
 		else if (segment->fastack >= resent) {
 			if ((int)segment->xmit <= kcp->fastlimit || 
 				kcp->fastlimit <= 0) {
