@@ -616,13 +616,14 @@ static void ikcp_parse_fastack(ikcpcb *kcp, IUINT32 sn, IUINT32 ts)
 	if (_itimediff(sn, kcp->snd_una) < 0 || _itimediff(sn, kcp->snd_nxt) >= 0)
 		return;
 
+	// snd_buf 是按 sn 从小到大排序的；
 	for (p = kcp->snd_buf.next; p != &kcp->snd_buf; p = next) {
 		IKCPSEG *seg = iqueue_entry(p, IKCPSEG, node);
 		next = p->next;
 		if (_itimediff(sn, seg->sn) < 0) {
 			break;
 		}
-		else if (sn != seg->sn) {
+		else if (sn != seg->sn) { // 说明收到后面 segment 的 ack ，却没有收到前面 segment 的 ack, 则对前面的每一个 segment 增加计数。
 		#ifndef IKCP_FASTACK_CONSERVE
 			seg->fastack++;
 		#else

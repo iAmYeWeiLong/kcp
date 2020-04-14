@@ -277,7 +277,7 @@ struct IKCPSEG
 	IUINT32 len;
 	IUINT32 resendts; // resend timestamp 时间到了这个时间戳就发重发
 	IUINT32 rto; // retransmission timeout
-	IUINT32 fastack; // fast ack 以数据驱动的快速重传机制
+	IUINT32 fastack; // fast ack 计数器，以数据驱动的快速重传机制
 	IUINT32 xmit; // 每发送一次会自加一。用于统计该Segment被重传了几次
 	char data[1];
 };
@@ -309,7 +309,7 @@ struct IKCPCB
 	void *user;
 	char *buffer;
 	int fastresend;
-	int fastlimit;
+	int fastlimit; // 重传次数限制，值为 0 时表示不限制重传次数。
 	int nocwnd, stream;
 	int logmask;
 	int (*output)(const char *buf, int len, struct IKCPCB *kcp, void *user);
