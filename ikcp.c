@@ -378,7 +378,7 @@ int ikcp_recv(ikcpcb *kcp, char *buffer, int len)
 		return -3;
 
 	if (kcp->nrcv_que >= kcp->rcv_wnd)
-		recover = 1;
+		recover = 1; // 在取出数据之前，接收窗口是满的
 
 	// merge fragment
 	for (len = 0, p = kcp->rcv_queue.next; p != &kcp->rcv_queue; ) {
@@ -424,8 +424,8 @@ int ikcp_recv(ikcpcb *kcp, char *buffer, int len)
 		}
 	}
 
-	// fast recover
-	if (kcp->nrcv_que < kcp->rcv_wnd && recover) {
+	// fast recover // 快速恢复？??
+	if (kcp->nrcv_que < kcp->rcv_wnd && recover) { // 取数据前接收窗口满了，取完数据之后接收窗口有空位了，要通知到对端
 		// ready to send back IKCP_CMD_WINS in ikcp_flush
 		// tell remote my window size
 		kcp->probe |= IKCP_ASK_TELL;
@@ -507,7 +507,7 @@ int ikcp_send(ikcpcb *kcp, const char *buffer, int len)
 	if (len <= (int)kcp->mss) count = 1;
 	else count = (len + kcp->mss - 1) / kcp->mss;
 
-	if (count >= (int)IKCP_WND_RCV) return -2; // 说明外部也不能直接 ikcp_send() 太大的 data
+	if (count >= (int)IKCP_WND_RCV) return -2; // 虽然可以拆成多个 segment,但是外部也不能直接 ikcp_send() 太大的 data，导致 segment 过多
 
 	if (count == 0) count = 1;
 
@@ -851,9 +851,9 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 
 					ikcp_parse_data(kcp, seg);
 				}
-			}
+			} // 看来接收窗口不够时，直接扔掉数据，等重传。
 		}
-		else if (cmd == IKCP_CMD_WASK) {
+		else if (cmd == IKCP_CMD_WASK) { // windows ask. 询问窗口大小
 			// ready to send back IKCP_CMD_WINS in ikcp_flush
 			// tell remote my window size
 			kcp->probe |= IKCP_ASK_TELL; // 询问窗口，并不马上回复。需要 ikcp_update() 时再回复
@@ -861,7 +861,7 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 				ikcp_log(kcp, IKCP_LOG_IN_PROBE, "input probe");
 			}
 		}
-		else if (cmd == IKCP_CMD_WINS) { // 窗口大小包头上有专门字段，这里不用做什么了
+		else if (cmd == IKCP_CMD_WINS) { // 回复窗口大小。包头上有专门字段，这里不用做什么了
 			// do nothing
 			if (ikcp_canlog(kcp, IKCP_LOG_IN_WINS)) {
 				ikcp_log(kcp, IKCP_LOG_IN_WINS,
@@ -1010,7 +1010,7 @@ void ikcp_flush(ikcpcb *kcp)
 	}
 
 	// flush window probing commands
-	if (kcp->probe & IKCP_ASK_TELL) { // ikcp_input 收包那里设的这个标志
+	if (kcp->probe & IKCP_ASK_TELL) { // ikcp_input()收包那里 和外部取包 ikcp_recv() 设的这个标志
 		seg.cmd = IKCP_CMD_WINS;
 		size = (int)(ptr - buffer);
 		if (size + (int)IKCP_OVERHEAD > (int)kcp->mtu) {
@@ -1042,7 +1042,7 @@ void ikcp_flush(ikcpcb *kcp)
 		newseg->cmd = IKCP_CMD_PUSH;
 		newseg->wnd = seg.wnd;
 		newseg->ts = current;
-		newseg->sn = kcp->snd_nxt++;
+		newseg->sn = kcp->snd_nxt++; // 代码中很多对 segment->sn 比较大小的操作，这里溢出后那些代码还正确吗？？？
 		newseg->una = kcp->rcv_nxt;
 		newseg->resendts = current;
 		newseg->rto = kcp->rx_rto;
@@ -1069,7 +1069,7 @@ void ikcp_flush(ikcpcb *kcp)
 		else if (_itimediff(current, segment->resendts) >= 0) {
 			needsend = 1;
 			segment->xmit++;
-			kcp->xmit++;
+			kcp->xmit++; // 这个记数好像没有什么用
 			if (kcp->nodelay == 0) {
 				segment->rto += kcp->rx_rto;
 			}	else {
@@ -1118,7 +1118,7 @@ void ikcp_flush(ikcpcb *kcp)
 				kcp->state = (IUINT32)-1;
 			}
 		}
-	}
+	} // for
 
 	// flash remain segments
 	size = (int)(ptr - buffer);
