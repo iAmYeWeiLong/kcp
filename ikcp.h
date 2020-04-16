@@ -289,13 +289,13 @@ struct IKCPSEG
 struct IKCPCB
 {
 	IUINT32 conv, mtu, mss, state;
-	IUINT32 snd_una, snd_nxt, rcv_nxt;
+	IUINT32 snd_una, snd_nxt, rcv_nxt; // ； ； 下一个期待收到的报文
 	IUINT32 ts_recent, ts_lastack, ssthresh; // ; ;slow start thrshold 慢启动阀值
 	IINT32 rx_rttval, rx_srtt, rx_rto, rx_minrto;
 	IUINT32 snd_wnd, rcv_wnd, rmt_wnd, cwnd, probe; // send_window;receive_window;remote_window;
 	IUINT32 current, interval, ts_flush, xmit;
 	IUINT32 nrcv_buf, nsnd_buf;
-	IUINT32 nrcv_que, nsnd_que;
+	IUINT32 nrcv_que, nsnd_que; // 长度受 rcv_wnd 限制
 	IUINT32 nodelay, updated;
 	IUINT32 ts_probe, probe_wait;
 	IUINT32 dead_link, incr;

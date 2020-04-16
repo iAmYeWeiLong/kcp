@@ -252,7 +252,7 @@ ikcpcb* ikcp_create(IUINT32 conv, void *user)
 	kcp->probe = 0;
 	kcp->mtu = IKCP_MTU_DEF;
 	kcp->mss = kcp->mtu - IKCP_OVERHEAD;
-	kcp->stream = 0;
+	kcp->stream = 0; // 默认是消息模式。
 
 	kcp->buffer = (char*)ikcp_malloc((kcp->mtu + IKCP_OVERHEAD) * 3);
 	if (kcp->buffer == NULL) {
@@ -374,7 +374,7 @@ int ikcp_recv(ikcpcb *kcp, char *buffer, int len)
 	if (peeksize < 0) 
 		return -2;
 
-	if (peeksize > len) 
+	if (peeksize > len) // 目前来看，在消息模式下，外部传进来的 buf 不能小于 消息的长度
 		return -3;
 
 	if (kcp->nrcv_que >= kcp->rcv_wnd)
@@ -411,6 +411,7 @@ int ikcp_recv(ikcpcb *kcp, char *buffer, int len)
 	assert(len == peeksize);
 
 	// move available data from rcv_buf -> rcv_queue
+	// 序号连续的才能移过去 （ ikcp_input() --> ikcp_parse_data()里面也移了一次 ）
 	while (! iqueue_is_empty(&kcp->rcv_buf)) {
 		seg = iqueue_entry(kcp->rcv_buf.next, IKCPSEG, node);
 		if (seg->sn == kcp->rcv_nxt && kcp->nrcv_que < kcp->rcv_wnd) {
@@ -423,7 +424,6 @@ int ikcp_recv(ikcpcb *kcp, char *buffer, int len)
 			break;
 		}
 	}
-
 	// fast recover // 快速恢复？??
 	if (kcp->nrcv_que < kcp->rcv_wnd && recover) { // 取数据前接收窗口满了，取完数据之后接收窗口有空位了，要通知到对端
 		// ready to send back IKCP_CMD_WINS in ikcp_flush
@@ -475,7 +475,7 @@ int ikcp_send(ikcpcb *kcp, const char *buffer, int len)
 	if (len < 0) return -1;
 
 	// append to previous segment in streaming mode (if possible)
-	if (kcp->stream != 0) {
+	if (kcp->stream != 0) { // 是流模式
 		if (!iqueue_is_empty(&kcp->snd_queue)) {
 			IKCPSEG *old = iqueue_entry(kcp->snd_queue.prev, IKCPSEG, node);
 			if (old->len < kcp->mss) {
@@ -524,7 +524,7 @@ int ikcp_send(ikcpcb *kcp, const char *buffer, int len)
 			memcpy(seg->data, buffer, size);
 		}
 		seg->len = size;
-		seg->frg = (kcp->stream == 0)? (count - i - 1) : 0;
+		seg->frg = (kcp->stream == 0)? (count - i - 1) : 0; // 从大到小
 		iqueue_init(&seg->node);
 		iqueue_add_tail(&seg->node, &kcp->snd_queue);
 		kcp->nsnd_que++;
@@ -609,6 +609,7 @@ static void ikcp_parse_una(ikcpcb *kcp, IUINT32 una)
 	}
 }
 
+// 收到 out-of-order ack 时，给前面报文加计数。
 static void ikcp_parse_fastack(ikcpcb *kcp, IUINT32 sn, IUINT32 ts)
 {
 	struct IQUEUEHEAD *p, *next;
@@ -690,8 +691,8 @@ void ikcp_parse_data(ikcpcb *kcp, IKCPSEG *newseg)
 	IUINT32 sn = newseg->sn;
 	int repeat = 0;
 	
-	if (_itimediff(sn, kcp->rcv_nxt + kcp->rcv_wnd) >= 0 ||
-		_itimediff(sn, kcp->rcv_nxt) < 0) {
+	if (_itimediff(sn, kcp->rcv_nxt + kcp->rcv_wnd) >= 0 || // 超过接收窗口
+		_itimediff(sn, kcp->rcv_nxt) < 0) { // 已经收过这个包了，( 超时重传，快速重传会导致网络上可能有多个相同的包 )
 		ikcp_segment_delete(kcp, newseg);
 		return;
 	}
@@ -724,6 +725,7 @@ void ikcp_parse_data(ikcpcb *kcp, IKCPSEG *newseg)
 #endif
 
 	// move available data from rcv_buf -> rcv_queue
+	// 序号连续的才能移过去（ ikcp_recv() 函数里也移了一次 ）
 	while (! iqueue_is_empty(&kcp->rcv_buf)) {
 		IKCPSEG *seg = iqueue_entry(kcp->rcv_buf.next, IKCPSEG, node);
 		if (seg->sn == kcp->rcv_nxt && kcp->nrcv_que < kcp->rcv_wnd) {
@@ -832,9 +834,9 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 				ikcp_log(kcp, IKCP_LOG_IN_DATA, 
 					"input psh: sn=%lu ts=%lu", (unsigned long)sn, (unsigned long)ts);
 			}
-			if (_itimediff(sn, kcp->rcv_nxt + kcp->rcv_wnd) < 0) { // other 如果还有足够多的接收窗口
-				ikcp_ack_push(kcp, sn, ts); // 生成当前包的ack（会在 flush 中发送 ack 给远端)
-				if (_itimediff(sn, kcp->rcv_nxt) >= 0) { // other 如果当前segment还没被接收过sn >= rcv_next
+			if (_itimediff(sn, kcp->rcv_nxt + kcp->rcv_wnd) < 0) { // 如果还有足够多的接收窗口
+				ikcp_ack_push(kcp, sn, ts); // 生成当前包的ack（会在 flush 中发送 ack 给对端)
+				if (_itimediff(sn, kcp->rcv_nxt) >= 0) { // 如果当前 segment 还没被接收过 sn >= rcv_next
 					seg = ikcp_segment_new(kcp, len);
 					seg->conv = conv;
 					seg->cmd = cmd;
@@ -876,7 +878,7 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 		size -= len;
 	}
 
-	if (flag != 0) {
+	if (flag != 0) { // 收到 out-of-order ack 时，给前面报文加计数。
 		ikcp_parse_fastack(kcp, maxack, latest_ts);
 	}
 
@@ -1059,13 +1061,13 @@ void ikcp_flush(ikcpcb *kcp)
 	for (p = kcp->snd_buf.next; p != &kcp->snd_buf; p = p->next) {
 		IKCPSEG *segment = iqueue_entry(p, IKCPSEG, node);
 		int needsend = 0;
-		if (segment->xmit == 0) { // other 该segment是第一次发送，需要发送出去
+		if (segment->xmit == 0) { // 该segment是第一次发送，需要发送出去
 			needsend = 1;
 			segment->xmit++;
 			segment->rto = kcp->rx_rto;
 			segment->resendts = current + segment->rto + rtomin;
 		}
-		// other 当前时间已经到了该segment的重发时间（却还在snd_buf中，证明一直没收到该segment的ack，可认为这个segment丢了），也需要发送出去
+		// 超时重传。当前时间已经到了该 segment 的重发时间（却还在snd_buf中，证明一直没收到该segment的ack，可认为这个segment丢了），也需要发送出去
 		else if (_itimediff(current, segment->resendts) >= 0) {
 			needsend = 1;
 			segment->xmit++;
@@ -1078,7 +1080,7 @@ void ikcp_flush(ikcpcb *kcp)
 			segment->resendts = current + segment->rto;
 			lost = 1;
 		}
-		// other 该segment的fastack大于resent了，也认为需要重发出去
+		// 快速重传。 该segment的fastack大于resent了，也认为需要重发出去
 		// 1. fastack是个计数器，每次收到远端的ack包时，而该包又不属于自己的ack包时，该值就会加1
         // 2. resent由fastresend赋值，fastresend可由外部配置是否快速重传
         // 3. 这个条件可加快丢包重传，但会浪费多点带宽（因为可能该segment只是到达的慢一点而已，这个会导致有更高的概率重传多次同一个segment）
