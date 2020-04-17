@@ -278,7 +278,7 @@ ikcpcb* ikcp_create(IUINT32 conv, void *user)
 	kcp->rx_minrto = IKCP_RTO_MIN;
 	kcp->current = 0;
 	kcp->interval = IKCP_INTERVAL;
-	kcp->ts_flush = IKCP_INTERVAL;
+	kcp->ts_flush = IKCP_INTERVAL; // 方便第 1 次调用 ikcp_check()时返回这个初始值
 	kcp->nodelay = 0;
 	kcp->updated = 0;
 	kcp->logmask = 0;
@@ -410,6 +410,7 @@ int ikcp_recv(ikcpcb *kcp, char *buffer, int len)
 
 	assert(len == peeksize);
 
+	// 为下一次的 ikcp_recv() 调用做准备。
 	// move available data from rcv_buf -> rcv_queue
 	// 序号连续的才能移过去 （ ikcp_input() --> ikcp_parse_data()里面也移了一次 ）
 	while (! iqueue_is_empty(&kcp->rcv_buf)) {
@@ -425,7 +426,7 @@ int ikcp_recv(ikcpcb *kcp, char *buffer, int len)
 		}
 	}
 	// fast recover // 快速恢复？??
-	if (kcp->nrcv_que < kcp->rcv_wnd && recover) { // 取数据前接收窗口满了，取完数据之后接收窗口有空位了，要通知到对端
+	if (kcp->nrcv_que < kcp->rcv_wnd && recover) { // 取数据前接收窗口满了，取完数据之后接收窗口有空位了，要主动通知到对端
 		// ready to send back IKCP_CMD_WINS in ikcp_flush
 		// tell remote my window size
 		kcp->probe |= IKCP_ASK_TELL;
@@ -639,6 +640,7 @@ static void ikcp_parse_fastack(ikcpcb *kcp, IUINT32 sn, IUINT32 ts)
 //---------------------------------------------------------------------
 // ack append
 //---------------------------------------------------------------------
+// 对 sn 该报文的确认 ACK 报文放入 ACK 列表acklist中 （会在 flush 中发送ack出去)
 static void ikcp_ack_push(ikcpcb *kcp, IUINT32 sn, IUINT32 ts)
 {
 	size_t newsize = kcp->ackcount + 1;
@@ -656,7 +658,7 @@ static void ikcp_ack_push(ikcpcb *kcp, IUINT32 sn, IUINT32 ts)
 			abort();
 		}
 
-		if (kcp->acklist != NULL) {
+		if (kcp->acklist != NULL) { // 复制旧的 acklist,不能丢了旧的数据
 			size_t x;
 			for (x = 0; x < kcp->ackcount; x++) {
 				acklist[x * 2 + 0] = kcp->acklist[x * 2 + 0];
@@ -965,6 +967,7 @@ void ikcp_flush(ikcpcb *kcp)
 
 	// flush acknowledges; 因为是全双工，己方也会收到的数据，要发 ack 给对端
 	// 数据 是 ikcp_input() 中收到 IKCP_CMD_PUSH 命令时准备好的。
+	// 选择性 ack (ack 是流模式的)
 	count = kcp->ackcount;
 	for (i = 0; i < count; i++) {
 		size = (int)(ptr - buffer);
@@ -976,7 +979,7 @@ void ikcp_flush(ikcpcb *kcp)
 		ptr = ikcp_encode_seg(ptr, &seg); // 一个 ack 产生一个 segment（选择性 ack）;会不会比较冗余啊？
 	}
 
-	kcp->ackcount = 0;
+	kcp->ackcount = 0; // ack 发完了就行了。万一 ack 丢了，对端会重发数据
 
 	// probe window size (if remote window size equals zero)
 	if (kcp->rmt_wnd == 0) {
@@ -1129,7 +1132,7 @@ void ikcp_flush(ikcpcb *kcp)
 	}
 
 	// update ssthresh. 更新 slow start threshold
-	if (change) {
+	if (change) { // 发生了 快速重传
 		IUINT32 inflight = kcp->snd_nxt - kcp->snd_una;
 		kcp->ssthresh = inflight / 2;
 		if (kcp->ssthresh < IKCP_THRESH_MIN)
@@ -1138,7 +1141,7 @@ void ikcp_flush(ikcpcb *kcp)
 		kcp->incr = kcp->cwnd * kcp->mss;
 	}
 
-	if (lost) {
+	if (lost) { // 发生了 超时重传
 		kcp->ssthresh = cwnd / 2;
 		if (kcp->ssthresh < IKCP_THRESH_MIN)
 			kcp->ssthresh = IKCP_THRESH_MIN;
@@ -1177,8 +1180,8 @@ void ikcp_update(ikcpcb *kcp, IUINT32 current)
 	}
 
 	if (slap >= 0) {
-		kcp->ts_flush += kcp->interval;
-		if (_itimediff(kcp->current, kcp->ts_flush) >= 0) {
+		kcp->ts_flush += kcp->interval; // 下一次需要 flush 的时间戳
+		if (_itimediff(kcp->current, kcp->ts_flush) >= 0) { // ????
 			kcp->ts_flush = kcp->current + kcp->interval;
 		}
 		ikcp_flush(kcp);

@@ -304,8 +304,8 @@ struct IKCPCB
 	struct IQUEUEHEAD snd_buf;
 	struct IQUEUEHEAD rcv_buf;
 	IUINT32 *acklist;
-	IUINT32 ackcount;
-	IUINT32 ackblock;
+	IUINT32 ackcount; // acklist 实际存放的有效数据个数 size 或是 len 的意思
+	IUINT32 ackblock; // acklist 的容量 capacity (按规律放大，大了之后不再缩小或回收)
 	void *user;
 	char *buffer;
 	int fastresend;
