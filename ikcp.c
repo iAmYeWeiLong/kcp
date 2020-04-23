@@ -369,7 +369,7 @@ int ikcp_recv(ikcpcb *kcp, char *buffer, int len)
 
 	if (len < 0) len = -len;
 
-	peeksize = ikcp_peeksize(kcp);
+	peeksize = ikcp_peeksize(kcp); // 消息长度
 
 	if (peeksize < 0) 
 		return -2;
@@ -887,10 +887,10 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 	if (_itimediff(kcp->snd_una, prev_una) > 0) {
 		if (kcp->cwnd < kcp->rmt_wnd) {
 			IUINT32 mss = kcp->mss;
-			if (kcp->cwnd < kcp->ssthresh) {
+			if (kcp->cwnd < kcp->ssthresh) { // 当前处于 慢启动阶段
 				kcp->cwnd++;
 				kcp->incr += mss;
-			}	else {
+			}	else { // 当前处于 拥塞避免阶段
 				if (kcp->incr < mss) kcp->incr = mss;
 				kcp->incr += (mss * mss) / kcp->incr + (mss / 16);
 				if ((kcp->cwnd + 1) * mss <= kcp->incr) {
@@ -1003,6 +1003,7 @@ void ikcp_flush(ikcpcb *kcp)
 		kcp->probe_wait = 0;
 	}
 
+	// 将窗口探测报文发送出去 (ZWP: Zero Window Probe 零窗探测)
 	// flush window probing commands
 	if (kcp->probe & IKCP_ASK_SEND) { // 就在上面设的标志
 		seg.cmd = IKCP_CMD_WASK;
@@ -1014,8 +1015,9 @@ void ikcp_flush(ikcpcb *kcp)
 		ptr = ikcp_encode_seg(ptr, &seg);
 	}
 
+	// 将窗口回复报文发送出去 
 	// flush window probing commands
-	if (kcp->probe & IKCP_ASK_TELL) { // ikcp_input()收包那里 和外部取包 ikcp_recv() 设的这个标志
+	if (kcp->probe & IKCP_ASK_TELL) { //  收包那里 ikcp_input()--回复对端探测包 和 外部取包 ikcp_recv()--主动告知 设的这个标志
 		seg.cmd = IKCP_CMD_WINS;
 		size = (int)(ptr - buffer);
 		if (size + (int)IKCP_OVERHEAD > (int)kcp->mtu) {
@@ -1120,7 +1122,7 @@ void ikcp_flush(ikcpcb *kcp)
 			}
 
 			if (segment->xmit >= kcp->dead_link) {
-				kcp->state = (IUINT32)-1;
+				kcp->state = (IUINT32)-1; // 这个状态没有什么用啊 ？！
 			}
 		}
 	} // for
@@ -1141,7 +1143,7 @@ void ikcp_flush(ikcpcb *kcp)
 		kcp->incr = kcp->cwnd * kcp->mss;
 	}
 
-	if (lost) { // 发生了 超时重传
+	if (lost) { // 发生了 超时重传,回到 慢启动
 		kcp->ssthresh = cwnd / 2;
 		if (kcp->ssthresh < IKCP_THRESH_MIN)
 			kcp->ssthresh = IKCP_THRESH_MIN;
