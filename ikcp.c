@@ -887,10 +887,10 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 	if (_itimediff(kcp->snd_una, prev_una) > 0) {
 		if (kcp->cwnd < kcp->rmt_wnd) {
 			IUINT32 mss = kcp->mss;
-			if (kcp->cwnd < kcp->ssthresh) { // 当前处于 慢启动阶段
-				kcp->cwnd++;
+			if (kcp->cwnd < kcp->ssthresh) { // 当前处于 慢启动阶段（指数规律增长）
+				kcp->cwnd++; // 注意：看似简单地加 1，但是在时间轴上来看是指数增大 2,4,8,16,32.....
 				kcp->incr += mss;
-			}	else { // 当前处于 拥塞避免阶段
+			}	else { // 当前处于 拥塞避免阶段（加法加大，线性规律增长 ？？？？？）
 				if (kcp->incr < mss) kcp->incr = mss;
 				kcp->incr += (mss * mss) / kcp->incr + (mss / 16);
 				if ((kcp->cwnd + 1) * mss <= kcp->incr) {
