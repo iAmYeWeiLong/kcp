@@ -380,7 +380,7 @@ int ikcp_recv(ikcpcb *kcp, char *buffer, int len)
 	if (kcp->nrcv_que >= kcp->rcv_wnd)
 		recover = 1; // 在取出数据之前，接收窗口是满的
 
-	// merge fragment
+	// merge fragment 把 数据拷到 输出参数 buffer 上。然后删掉
 	for (len = 0, p = kcp->rcv_queue.next; p != &kcp->rcv_queue; ) {
 		int fragment;
 		seg = iqueue_entry(p, IKCPSEG, node);
@@ -839,6 +839,8 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 			if (_itimediff(sn, kcp->rcv_nxt + kcp->rcv_wnd) < 0) { // 如果还有足够多的接收窗口
 				ikcp_ack_push(kcp, sn, ts); // 生成当前包的ack（会在 flush 中发送 ack 给对端)
 				if (_itimediff(sn, kcp->rcv_nxt) >= 0) { // 如果当前 segment 还没被接收过 sn >= rcv_next
+					// 网上说 TCP 会检查收到的 segment 是不是 out of order,是否需要快速 ack ，而不能 delay ack (数据捎带ACK)
+					// 这是不是意味着，一收到 ikcp_input() 要及时 flush() 呢
 					seg = ikcp_segment_new(kcp, len);
 					seg->conv = conv;
 					seg->cmd = cmd;
@@ -891,11 +893,12 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 				kcp->cwnd++; // 注意：看似简单地加 1，但是在时间轴上来看是指数增大 2,4,8,16,32.....
 				kcp->incr += mss;
 			}	else { // 当前处于 拥塞避免阶段（加法加大，线性规律增长 ？？？？？）
+				// TCP: 每经过 一个往返时间增加一个MSS的大小
 				if (kcp->incr < mss) kcp->incr = mss;
 				kcp->incr += (mss * mss) / kcp->incr + (mss / 16);
 				if ((kcp->cwnd + 1) * mss <= kcp->incr) {
 				#if 1
-					kcp->cwnd = (kcp->incr + mss - 1) / ((mss > 0)? mss : 1);
+					kcp->cwnd = (kcp->incr + mss - 1) / ((mss > 0)? mss : 1); // mss 还会小于等于 0 吗？？！！
 				#else
 					kcp->cwnd++;
 				#endif
@@ -1143,8 +1146,8 @@ void ikcp_flush(ikcpcb *kcp)
 		kcp->incr = kcp->cwnd * kcp->mss;
 	}
 
-	if (lost) { // 发生了 超时重传,回到 慢启动
-		kcp->ssthresh = cwnd / 2;
+	if (lost) { // 发生了 “超时重传”,回到“慢启动”阶段  [cwnd < ssthresh 就是慢启动]
+		kcp->ssthresh = cwnd / 2; // 乘法减小，我以为是 ssthresh 减半，原来是 cwnd 减半处理
 		if (kcp->ssthresh < IKCP_THRESH_MIN)
 			kcp->ssthresh = IKCP_THRESH_MIN;
 		kcp->cwnd = 1;
