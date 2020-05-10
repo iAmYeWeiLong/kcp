@@ -238,8 +238,8 @@ ikcpcb* ikcp_create(IUINT32 conv, void *user)
 	kcp->conv = conv;
 	kcp->user = user;
 	kcp->snd_una = 0;
-	kcp->snd_nxt = 0;
-	kcp->rcv_nxt = 0;
+	kcp->snd_nxt = 0; // 并没有像 TCP 的 Sequence Number 跟时间增加而变化, 使得难以猜测。
+	kcp->rcv_nxt = 0; // 下一个期待收到的报文序号，因为 snd_nxt 从 0 开始，所以这个变量也得从 0 开始
 	kcp->ts_recent = 0;
 	kcp->ts_lastack = 0;
 	kcp->ts_probe = 0;
@@ -412,7 +412,7 @@ int ikcp_recv(ikcpcb *kcp, char *buffer, int len)
 
 	// 为下一次的 ikcp_recv() 调用做准备。
 	// move available data from rcv_buf -> rcv_queue
-	// 序号连续的才能移过去 （ ikcp_input() --> ikcp_parse_data()里面也移了一次 ）
+	// 是期望的 rcv_nxt 的才能移过去 （ ikcp_input() --> ikcp_parse_data()里面也移了一次 ）
 	while (! iqueue_is_empty(&kcp->rcv_buf)) {
 		seg = iqueue_entry(kcp->rcv_buf.next, IKCPSEG, node);
 		if (seg->sn == kcp->rcv_nxt && kcp->nrcv_que < kcp->rcv_wnd) {
@@ -544,6 +544,8 @@ int ikcp_send(ikcpcb *kcp, const char *buffer, int len)
 //---------------------------------------------------------------------
 static void ikcp_update_ack(ikcpcb *kcp, IINT32 rtt)
 {
+	// rx_rttval : RTT的平均偏差，用来衡量RTT的抖动
+	// rx_srtt : RTT的一个加权RTT平均值，平滑值
 	IINT32 rto = 0;
 	if (kcp->rx_srtt == 0) {
 		kcp->rx_srtt = rtt;
@@ -564,7 +566,7 @@ static void ikcp_shrink_buf(ikcpcb *kcp)
 	struct IQUEUEHEAD *p = kcp->snd_buf.next;
 	if (p != &kcp->snd_buf) {
 		IKCPSEG *seg = iqueue_entry(p, IKCPSEG, node);
-		kcp->snd_una = seg->sn;
+		kcp->snd_una = seg->sn; // snd_buf 中的第 1 个节点就是 una
 	}	else {
 		kcp->snd_una = kcp->snd_nxt;
 	}
@@ -593,7 +595,8 @@ static void ikcp_parse_ack(ikcpcb *kcp, IUINT32 sn)
 	}
 }
 
-// 把 send buffer una 之前的全删了。
+// 把参数 una 之前的 send buffer 全删了。
+// 因为 una 之前的对方已经全部收到了
 static void ikcp_parse_una(ikcpcb *kcp, IUINT32 una)
 {
 	struct IQUEUEHEAD *p, *next;
@@ -727,7 +730,7 @@ void ikcp_parse_data(ikcpcb *kcp, IKCPSEG *newseg)
 #endif
 
 	// move available data from rcv_buf -> rcv_queue
-	// 序号连续的才能移过去（ ikcp_recv() 函数里也移了一次 ）
+	// 是期望的 rcv_nxt 才能移过去（ ikcp_recv() 函数里也移了一次 ）
 	while (! iqueue_is_empty(&kcp->rcv_buf)) {
 		IKCPSEG *seg = iqueue_entry(kcp->rcv_buf.next, IKCPSEG, node);
 		if (seg->sn == kcp->rcv_nxt && kcp->nrcv_que < kcp->rcv_wnd) {
@@ -796,11 +799,14 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 			return -3;
 
 		kcp->rmt_wnd = wnd;
+		//** 分析una，看哪些segment远端收到了，删除send_buf中小于una的segment
 		ikcp_parse_una(kcp, una);
+		
+		//** 更新本地 snd_una 数据，如snd_buff为空，snd_una指向snd_nxt，否则指向send_buff首端
 		ikcp_shrink_buf(kcp);
 
 		if (cmd == IKCP_CMD_ACK) { // 除了每个包都有 una ，还有专门的 ack 命令（选择性 ack）
-			if (_itimediff(kcp->current, ts) >= 0) {
+			if (_itimediff(kcp->current, ts) >= 0) { // 基本上肯定为真，因为 ts 是echo 回来的我方时间戳。除非本地的时间错乱了
 				// other 此处实际上是在更新rto
 				// other 因为此时收到远端的ack，所以我们知道远端的包到本机的时间，因此可统计当前的网速如何，进行调整
 				ikcp_update_ack(kcp, _itimediff(kcp->current, ts));
@@ -837,10 +843,10 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 					"input psh: sn=%lu ts=%lu", (unsigned long)sn, (unsigned long)ts);
 			}
 			if (_itimediff(sn, kcp->rcv_nxt + kcp->rcv_wnd) < 0) { // 如果还有足够多的接收窗口
-				ikcp_ack_push(kcp, sn, ts); // 生成当前包的ack（会在 flush 中发送 ack 给对端)
+				ikcp_ack_push(kcp, sn, ts); // 生成当前包的ack（会在 flush 中发送 ack 给对端); 时间也要 echo 回去给发送端。
 				if (_itimediff(sn, kcp->rcv_nxt) >= 0) { // 如果当前 segment 还没被接收过 sn >= rcv_next
 					// 网上说 TCP 会检查收到的 segment 是不是 out of order,是否需要快速 ack ，而不能 delay ack (数据捎带ACK)
-					// 这是不是意味着，一收到 ikcp_input() 要及时 flush() 呢
+					// 这是不是意味着，一收到 ikcp_input() 要及时 flush() 呢 ??
 					seg = ikcp_segment_new(kcp, len);
 					seg->conv = conv;
 					seg->cmd = cmd;
@@ -882,7 +888,7 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 		size -= len;
 	}
 
-	if (flag != 0) { // 收到 out-of-order ack 时，给前面报文加计数。
+	if (flag != 0) { // 表示本次有 ack 包；若收到 out-of-order ack 时，给前面报文加计数。
 		ikcp_parse_fastack(kcp, maxack, latest_ts);
 	}
 
@@ -1137,11 +1143,16 @@ void ikcp_flush(ikcpcb *kcp)
 	}
 
 	// update ssthresh. 更新 slow start threshold
-	if (change) { // 发生了 快速重传
+	if (change) { // 发生了 快速重传 ，进入 “拥塞避免” 阶段  [cwnd >= ssthresh 就是拥塞避免]
+		// 使得不进入 “慢启动” 阶段，就是 快速恢复 (fast recover)的意思。
 		IUINT32 inflight = kcp->snd_nxt - kcp->snd_una;
-		kcp->ssthresh = inflight / 2;
+		kcp->ssthresh = inflight / 2; // 乘法减小 ???
 		if (kcp->ssthresh < IKCP_THRESH_MIN)
 			kcp->ssthresh = IKCP_THRESH_MIN;
+		 
+		 // TCP:既然发送方收到三个重复的确认，就表明有三个分组已经离开了网络。这三个分组不再消耗网络 的资源而是停留在接收方的缓存中。
+		 // 可见现在网络中并不是堆积了分组而是减少了三个分组。因此可以适当把拥塞窗口扩大了些。
+		 // 这里在模仿 TCP 
 		kcp->cwnd = kcp->ssthresh + resent;
 		kcp->incr = kcp->cwnd * kcp->mss;
 	}
