@@ -542,6 +542,7 @@ int ikcp_send(ikcpcb *kcp, const char *buffer, int len)
 //---------------------------------------------------------------------
 // parse ack
 //---------------------------------------------------------------------
+// ywl: 这个函数目的是不断地修正 kcp->rx_rto
 static void ikcp_update_ack(ikcpcb *kcp, IINT32 rtt)
 {
 	// rx_rttval : RTT的平均偏差，用来衡量RTT的抖动
@@ -697,7 +698,7 @@ void ikcp_parse_data(ikcpcb *kcp, IKCPSEG *newseg)
 	int repeat = 0;
 	
 	if (_itimediff(sn, kcp->rcv_nxt + kcp->rcv_wnd) >= 0 || // 超过接收窗口
-		_itimediff(sn, kcp->rcv_nxt) < 0) { // 已经收过这个包了，( 超时重传，快速重传会导致网络上可能有多个相同的包 )
+		_itimediff(sn, kcp->rcv_nxt) < 0) { // 已经收过这个包了，( 超时重传，快速重传会导致网络上可能有重复的包 )
 		ikcp_segment_delete(kcp, newseg);
 		return;
 	}
@@ -843,7 +844,7 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 					"input psh: sn=%lu ts=%lu", (unsigned long)sn, (unsigned long)ts);
 			}
 			if (_itimediff(sn, kcp->rcv_nxt + kcp->rcv_wnd) < 0) { // 如果还有足够多的接收窗口
-				ikcp_ack_push(kcp, sn, ts); // 生成当前包的ack（会在 flush 中发送 ack 给对端); 时间也要 echo 回去给发送端。
+				ikcp_ack_push(kcp, sn, ts); // 生成当前包的ack（会在 flush 中发送 ack 给对端); ts 时间也要 echo 回去给发送端。
 				if (_itimediff(sn, kcp->rcv_nxt) >= 0) { // 如果当前 segment 还没被接收过 sn >= rcv_next
 					// 网上说 TCP 会检查收到的 segment 是不是 out of order,是否需要快速 ack ，而不能 delay ack (数据捎带ACK)
 					// 这是不是意味着，一收到 ikcp_input() 要及时 flush() 呢 ??
@@ -985,7 +986,7 @@ void ikcp_flush(ikcpcb *kcp)
 			ptr = buffer;
 		}
 		ikcp_ack_get(kcp, i, &seg.sn, &seg.ts);
-		ptr = ikcp_encode_seg(ptr, &seg); // 一个 ack 产生一个 segment（选择性 ack）;会不会比较冗余啊？
+		ptr = ikcp_encode_seg(ptr, &seg); // 每一个 ack 产生一个 segment（选择性 ack）;会不会比较冗余啊？
 	}
 
 	kcp->ackcount = 0; // ack 发完了就行了。万一 ack 丢了，对端会重发数据
@@ -1144,9 +1145,9 @@ void ikcp_flush(ikcpcb *kcp)
 
 	// update ssthresh. 更新 slow start threshold
 	if (change) { // 发生了 快速重传 ，进入 “拥塞避免” 阶段  [cwnd >= ssthresh 就是拥塞避免]
-		// 使得不进入 “慢启动” 阶段，就是 快速恢复 (fast recover)的意思。
-		IUINT32 inflight = kcp->snd_nxt - kcp->snd_una;
-		kcp->ssthresh = inflight / 2; // 乘法减小 ???
+		// 使得不进入 “慢启动” 阶段，且 cwnd 不要变成 1 就是 快速恢复 (fast recover)的意思。
+		IUINT32 inflight = kcp->snd_nxt - kcp->snd_una; // 发送窗口
+		kcp->ssthresh = inflight / 2; // 将拥塞窗口阈值ssthresh调整为当前发送窗口的一半。 ywl:乘法减小 ???
 		if (kcp->ssthresh < IKCP_THRESH_MIN)
 			kcp->ssthresh = IKCP_THRESH_MIN;
 		 
@@ -1157,7 +1158,7 @@ void ikcp_flush(ikcpcb *kcp)
 		kcp->incr = kcp->cwnd * kcp->mss;
 	}
 
-	if (lost) { // 发生了 “超时重传”,回到“慢启动”阶段  [cwnd < ssthresh 就是慢启动]
+	if (lost) { // 发生了 “超时重传”,回到“慢启动”阶段  [cwnd < ssthresh，且 cwnd = 1 就是慢启动]
 		kcp->ssthresh = cwnd / 2; // 乘法减小，我以为是 ssthresh 减半，原来是 cwnd 减半处理
 		if (kcp->ssthresh < IKCP_THRESH_MIN)
 			kcp->ssthresh = IKCP_THRESH_MIN;
@@ -1191,7 +1192,7 @@ void ikcp_update(ikcpcb *kcp, IUINT32 current)
 	slap = _itimediff(kcp->current, kcp->ts_flush);
 
 	if (slap >= 10000 || slap < -10000) {
-		kcp->ts_flush = kcp->current;
+		kcp->ts_flush = kcp->current; // 下一次需要 flush 的时间戳
 		slap = 0;
 	}
 
@@ -1218,7 +1219,7 @@ IUINT32 ikcp_check(const ikcpcb *kcp, IUINT32 current)
 {
 	IUINT32 ts_flush = kcp->ts_flush;
 	IINT32 tm_flush = 0x7fffffff;
-	IINT32 tm_packet = 0x7fffffff;
+	IINT32 tm_packet = 0x7fffffff; // snd_buf 中最小的 超时重发时间戳
 	IUINT32 minimal = 0;
 	struct IQUEUEHEAD *p;
 
@@ -1231,7 +1232,7 @@ IUINT32 ikcp_check(const ikcpcb *kcp, IUINT32 current)
 		ts_flush = current;
 	}
 
-	if (_itimediff(current, ts_flush) >= 0) {
+	if (_itimediff(current, ts_flush) >= 0) { // 到了或超过了原计划要 flush() 的时间
 		return current;
 	}
 
@@ -1240,12 +1241,13 @@ IUINT32 ikcp_check(const ikcpcb *kcp, IUINT32 current)
 	for (p = kcp->snd_buf.next; p != &kcp->snd_buf; p = p->next) {
 		const IKCPSEG *seg = iqueue_entry(p, const IKCPSEG, node);
 		IINT32 diff = _itimediff(seg->resendts, current);
-		if (diff <= 0) {
+		if (diff <= 0) { // 发现有包超时未 ack 需要重发
 			return current;
 		}
 		if (diff < tm_packet) tm_packet = diff;
 	}
 
+	// 看 最小的超时重传时间 和 原计划要 flush() 的时间 哪个先到来
 	minimal = (IUINT32)(tm_packet < tm_flush ? tm_packet : tm_flush);
 	if (minimal >= kcp->interval) minimal = kcp->interval;
 
@@ -1279,9 +1281,12 @@ int ikcp_interval(ikcpcb *kcp, int interval)
 
 int ikcp_nodelay(ikcpcb *kcp, int nodelay, int interval, int resend, int nc)
 {
+	// TCP 的 nodelay 是关闭 Nagle 算法。
 	if (nodelay >= 0) {
 		kcp->nodelay = nodelay;
 		if (nodelay) {
+			// 最小重传超时时间（如果需要可以设置更小）； 作用是用来控制 kcp->rx_rto 的
+			// 不管是 TCP还是 KCP计算 RTO时都有最小 RTO的限制，即便计算出来RTO为40ms，由于默认的 RTO是100ms，协议只有在100ms后才能检测到丢包
 			kcp->rx_minrto = IKCP_RTO_NDL;	
 		}	
 		else {

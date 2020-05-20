@@ -309,7 +309,7 @@ struct IKCPCB
 	void *user;
 	char *buffer;
 	int fastresend;
-	int fastlimit; // 重传次数限制，值为 0 时表示不限制重传次数。
+	int fastlimit; // 快速重传次数限制，值为 0 时表示不限制重传次数。
 	int nocwnd, stream; // 有没有启用 “拥塞窗口” 标志；流模式标志（默认是消息模式）
 	int logmask;
 	int (*output)(const char *buf, int len, struct IKCPCB *kcp, void *user);
