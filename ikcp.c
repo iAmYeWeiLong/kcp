@@ -413,6 +413,7 @@ int ikcp_recv(ikcpcb *kcp, char *buffer, int len)
 	// 为下一次的 ikcp_recv() 调用做准备。
 	// move available data from rcv_buf -> rcv_queue
 	// 是期望的 rcv_nxt 的才能移过去 （ ikcp_input() --> ikcp_parse_data()里面也移了一次 ）
+	// 要保证 rcv_queue 是有序且连续无空洞
 	while (! iqueue_is_empty(&kcp->rcv_buf)) {
 		seg = iqueue_entry(kcp->rcv_buf.next, IKCPSEG, node);
 		if (seg->sn == kcp->rcv_nxt && kcp->nrcv_que < kcp->rcv_wnd) {
@@ -478,28 +479,32 @@ int ikcp_send(ikcpcb *kcp, const char *buffer, int len)
 	// append to previous segment in streaming mode (if possible)
 	if (kcp->stream != 0) { // 是流模式
 		if (!iqueue_is_empty(&kcp->snd_queue)) {
+			// snd_queue.prev 得到的 old 是最后一个节点，因为是双向环形链表
 			IKCPSEG *old = iqueue_entry(kcp->snd_queue.prev, IKCPSEG, node);
 			if (old->len < kcp->mss) {
-				int capacity = kcp->mss - old->len;
+				int capacity = kcp->mss - old->len; // 最后一个节点剩余空间（不是真正的空间，是允许的最大的 segment,所以一定要生成新的 segment）
 				int extend = (len < capacity)? len : capacity;
 				seg = ikcp_segment_new(kcp, old->len + extend);
 				assert(seg);
 				if (seg == NULL) {
 					return -2;
 				}
+				// 先加到尾上，old 下面再删也不迟
 				iqueue_add_tail(&seg->node, &kcp->snd_queue);
-				memcpy(seg->data, old->data, old->len);
+				memcpy(seg->data, old->data, old->len); // 旧数据拷到新节点
 				if (buffer) {
-					memcpy(seg->data + old->len, buffer, extend);
+					memcpy(seg->data + old->len, buffer, extend); // 新数据也拷到新节点
 					buffer += extend;
 				}
 				seg->len = old->len + extend;
-				seg->frg = 0;
+				seg->frg = 0; // 流模式下都是 0
 				len -= extend;
+				// 删除 old 节点
 				iqueue_del_init(&old->node);
 				ikcp_segment_delete(kcp, old);
 			}
 		}
+		// 新生成的 segment 的空间都够存数据了
 		if (len <= 0) {
 			return 0;
 		}
@@ -513,7 +518,7 @@ int ikcp_send(ikcpcb *kcp, const char *buffer, int len)
 	if (count == 0) count = 1;
 
 	// fragment. 外部的一次 ikcp_send() 可能会拆分成多个 segment
-	// 数据先放到 snd_queue, 后面调用 ikcp_flush() 时再搬到 snd_queue
+	// 数据先放到 snd_queue, 后面调用 ikcp_flush() 时再搬到 snd_buf
 	for (i = 0; i < count; i++) {
 		int size = len > (int)kcp->mss ? (int)kcp->mss : len;
 		seg = ikcp_segment_new(kcp, size);
@@ -569,11 +574,11 @@ static void ikcp_shrink_buf(ikcpcb *kcp)
 		IKCPSEG *seg = iqueue_entry(p, IKCPSEG, node);
 		kcp->snd_una = seg->sn; // snd_buf 中的第 1 个节点就是 una
 	}	else {
-		kcp->snd_una = kcp->snd_nxt;
+		kcp->snd_una = kcp->snd_nxt; // 越界的非法下标（待发送，但未发送的）
 	}
 }
 
-// 选择性 ack.从 snd_buf 中删除 sn 节点
+// 选择性 ack.从 snd_buf 中删除 sn 节点。删掉 segment 后会导致 snd_buf 不连续
 static void ikcp_parse_ack(ikcpcb *kcp, IUINT32 sn)
 {
 	struct IQUEUEHEAD *p, *next;
@@ -590,13 +595,13 @@ static void ikcp_parse_ack(ikcpcb *kcp, IUINT32 sn)
 			kcp->nsnd_buf--;
 			break;
 		}
-		if (_itimediff(sn, seg->sn) < 0) {
+		if (_itimediff(sn, seg->sn) < 0) { // 重复收到 ack 了，snd_buf 中已经不存在这个 segment 了 ？？？
 			break;
 		}
 	}
 }
 
-// 把参数 una 之前的 send buffer 全删了。
+// 把 snd_buf 中参数 una 之前的 segment 全删了。
 // 因为 una 之前的对方已经全部收到了
 static void ikcp_parse_una(ikcpcb *kcp, IUINT32 una)
 {
@@ -690,6 +695,7 @@ static void ikcp_ack_get(const ikcpcb *kcp, int p, IUINT32 *sn, IUINT32 *ts)
 
 //---------------------------------------------------------------------
 // parse data
+// 数据放入 rec_buf(要保证有序，但不保证连续)
 //---------------------------------------------------------------------
 void ikcp_parse_data(ikcpcb *kcp, IKCPSEG *newseg)
 {
@@ -803,7 +809,7 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 		//** 分析una，看哪些segment远端收到了，删除send_buf中小于una的segment
 		ikcp_parse_una(kcp, una);
 		
-		//** 更新本地 snd_una 数据，如snd_buff为空，snd_una指向snd_nxt，否则指向send_buff首端
+		//** 更新本地 snd_una 数据，如 snd_buf 为空，snd_una指向snd_nxt，否则指向send_buff首端
 		ikcp_shrink_buf(kcp);
 
 		if (cmd == IKCP_CMD_ACK) { // 除了每个包都有 una ，还有专门的 ack 命令（选择性 ack）
@@ -845,7 +851,7 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 			}
 			if (_itimediff(sn, kcp->rcv_nxt + kcp->rcv_wnd) < 0) { // 如果还有足够多的接收窗口
 				ikcp_ack_push(kcp, sn, ts); // 生成当前包的ack（会在 flush 中发送 ack 给对端); ts 时间也要 echo 回去给发送端。
-				if (_itimediff(sn, kcp->rcv_nxt) >= 0) { // 如果当前 segment 还没被接收过 sn >= rcv_next
+				if (_itimediff(sn, kcp->rcv_nxt) >= 0) { // 如果当前 segment 还没被接收过。 sn >= rcv_next
 					// 网上说 TCP 会检查收到的 segment 是不是 out of order,是否需要快速 ack ，而不能 delay ack (数据捎带ACK)
 					// 这是不是意味着，一收到 ikcp_input() 要及时 flush() 呢 ??
 					seg = ikcp_segment_new(kcp, len);
@@ -1043,6 +1049,7 @@ void ikcp_flush(ikcpcb *kcp)
 	cwnd = _imin_(kcp->snd_wnd, kcp->rmt_wnd);
 	if (kcp->nocwnd == 0) cwnd = _imin_(kcp->cwnd, cwnd);
 
+	// 从 snd_queue 移到 snd_buf
 	// move data from snd_queue to snd_buf
 	while (_itimediff(kcp->snd_nxt, kcp->snd_una + cwnd) < 0) {
 		IKCPSEG *newseg;
@@ -1146,7 +1153,7 @@ void ikcp_flush(ikcpcb *kcp)
 	// update ssthresh. 更新 slow start threshold
 	if (change) { // 发生了 快速重传 ，进入 “拥塞避免” 阶段  [cwnd >= ssthresh 就是拥塞避免]
 		// 使得不进入 “慢启动” 阶段，且 cwnd 不要变成 1 就是 快速恢复 (fast recover)的意思。
-		IUINT32 inflight = kcp->snd_nxt - kcp->snd_una; // 发送窗口
+		IUINT32 inflight = kcp->snd_nxt - kcp->snd_una; // 真·发送窗口
 		kcp->ssthresh = inflight / 2; // 将拥塞窗口阈值ssthresh调整为当前发送窗口的一半。 ywl:乘法减小 ???
 		if (kcp->ssthresh < IKCP_THRESH_MIN)
 			kcp->ssthresh = IKCP_THRESH_MIN;
@@ -1264,8 +1271,11 @@ int ikcp_setmtu(ikcpcb *kcp, int mtu)
 	buffer = (char*)ikcp_malloc((mtu + IKCP_OVERHEAD) * 3);
 	if (buffer == NULL) 
 		return -2;
+	// 一般是指数据链路层的概念。但这里指的是下层能提供给上层使用的大小。
+	// 比如 以太网 MTU是1500字节，若是使用 udp 作下层协议，则作为参数传过来的 mtu 的合理值应该是： 1500-20(IP头部长度)-8(UDP头长度)=1472
 	kcp->mtu = mtu;
 	kcp->mss = kcp->mtu - IKCP_OVERHEAD; // 重设了 MTU 同时也要重设 mss
+	// MSS：Max Segment Size 指每个 segment 可以携带的用户数据，不包括 segment 头自身的大小。
 	ikcp_free(kcp->buffer);
 	kcp->buffer = buffer;
 	return 0;
@@ -1281,7 +1291,7 @@ int ikcp_interval(ikcpcb *kcp, int interval)
 
 int ikcp_nodelay(ikcpcb *kcp, int nodelay, int interval, int resend, int nc)
 {
-	// TCP 的 nodelay 是关闭 Nagle 算法。
+	// TCP 的 nodelay 是关闭 Nagle 算法。这里的 nodelay 有其他含义
 	if (nodelay >= 0) {
 		kcp->nodelay = nodelay;
 		if (nodelay) {
@@ -1312,7 +1322,7 @@ int ikcp_wndsize(ikcpcb *kcp, int sndwnd, int rcvwnd)
 {
 	if (kcp) {
 		if (sndwnd > 0) {
-			kcp->snd_wnd = sndwnd;
+			kcp->snd_wnd = sndwnd; // 假·发送窗口（只是硬上限）
 		}
 		if (rcvwnd > 0) {   // must >= max fragment size
 			kcp->rcv_wnd = _imax_(rcvwnd, IKCP_WND_RCV);
