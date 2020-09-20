@@ -1103,7 +1103,7 @@ void ikcp_flush(ikcpcb *kcp)
 			lost = 1;
 		}
 		// 快速重传。 该segment的fastack大于resent了，也认为需要重发出去
-		// 1. fastack是个计数器，每次收到远端的ack包时，而该包又不属于自己的ack包时，该值就会加1
+		// 1. fastack是个计数器，每次收到远端的非按序到达的 ack 包时，而该包又不属于自己的 ack 包时，该值就会加1
         // 2. resent由fastresend赋值，fastresend可由外部配置是否快速重传
         // 3. 这个条件可加快丢包重传，但会浪费多点带宽（因为可能该segment只是到达的慢一点而已，这个会导致有更高的概率重传多次同一个segment）
 		else if (segment->fastack >= resent) {
@@ -1154,7 +1154,7 @@ void ikcp_flush(ikcpcb *kcp)
 	if (change) { // 发生了 快速重传 ，进入 “拥塞避免” 阶段  [cwnd >= ssthresh 就是拥塞避免]
 		// 使得不进入 “慢启动” 阶段，且 cwnd 不要变成 1 就是 快速恢复 (fast recover)的意思。
 		IUINT32 inflight = kcp->snd_nxt - kcp->snd_una; // 真·发送窗口
-		kcp->ssthresh = inflight / 2; // 将拥塞窗口阈值ssthresh调整为当前发送窗口的一半。 ywl:乘法减小 ???
+		kcp->ssthresh = inflight / 2; // 将拥塞窗口阈值 ssthresh 调整为当前发送窗口的一半。 ywl:乘法减小 ???
 		if (kcp->ssthresh < IKCP_THRESH_MIN)
 			kcp->ssthresh = IKCP_THRESH_MIN;
 		 
